@@ -1,7 +1,7 @@
 import networkx as nx
 
 from opensfm import types
-import opensfm.reconstruction
+from opensfm import reconstruction
 
 
 def _add_shot(graph, reconstruction, shot_id):

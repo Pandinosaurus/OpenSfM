@@ -1,7 +1,7 @@
 from io import StringIO
 
-import opensfm.tracking
-import data_generation
+from opensfm import tracking
+from opensfm.test import data_generation
 
 
 def test_tracks_io():

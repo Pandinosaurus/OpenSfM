@@ -1,9 +1,9 @@
 import numpy as np
 from six import iteritems
 
-import opensfm.config
-import opensfm.matching
-import data_generation
+from opensfm import config
+from opensfm import matching
+from opensfm.test import data_generation
 
 
 def test_robust_match():

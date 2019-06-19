@@ -2,7 +2,7 @@ import numpy as np
 import networkx as nx
 
 from opensfm import io
-import opensfm.reconstruction
+from opensfm import reconstruction
 
 
 def test_track_triangulator_equirectangular():
