@@ -11,7 +11,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as colors
 import matplotlib.pyplot as plt
 import numpy as np
-from opensfm import io, multiview
+from opensfm import io, multiview, feature_loader, pymap
 from opensfm.dataset import DataSet, DataSetBase
 
 RESIDUAL_PIXEL_CUTOFF = 4
@@ -89,6 +89,7 @@ def gcp_errors(data: DataSetBase, reconstructions):
             else:
                 break
 
+        # pyre-fixme[61]: `triangulated` may not be initialized here.
         if triangulated is None:
             continue
         all_errors.append(triangulated - gcp.coordinates.value)
@@ -98,9 +99,10 @@ def gcp_errors(data: DataSetBase, reconstructions):
 
 def _compute_errors(reconstructions, tracks_manager):
     @lru_cache(10)
-    def _compute_errors_cached(index, normalized):
+    def _compute_errors_cached(index, error_type):
         return reconstructions[index].map.compute_reprojection_errors(
-            tracks_manager, normalized
+            tracks_manager,
+            error_type,
         )
 
     return _compute_errors_cached
@@ -114,39 +116,53 @@ def _get_valid_observations(reconstructions, tracks_manager):
     return _get_valid_observations_cached
 
 
-def _projection_error(data: DataSetBase, tracks_manager, reconstructions):
-    all_errors_normalized, all_errors_pixels = [], []
-    average_error_normalized, average_error_pixels = 0, 0
+def _projection_error(tracks_manager, reconstructions):
+    all_errors_normalized, all_errors_pixels, all_errors_angular = [], [], []
+    average_error_normalized, average_error_pixels, average_error_angular = 0, 0, 0
     for i in range(len(reconstructions)):
-        errors_normalized = _compute_errors(reconstructions, tracks_manager)(i, True)
-        errors_unnormalized = _compute_errors(reconstructions, tracks_manager)(i, False)
+        errors_normalized = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Normalized
+        )
+        errors_unnormalized = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Pixel
+        )
+        errors_angular = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Angular
+        )
 
         for shot_id, shot_errors_normalized in errors_normalized.items():
             shot = reconstructions[i].get_shot(shot_id)
             normalizer = max(shot.camera.width, shot.camera.height)
 
-            for error_normalized, error_unnormalized in zip(
-                shot_errors_normalized.values(), errors_unnormalized[shot_id].values()
+            for error_normalized, error_unnormalized, error_angular in zip(
+                shot_errors_normalized.values(),
+                errors_unnormalized[shot_id].values(),
+                errors_angular[shot_id].values(),
             ):
                 norm_pixels = _norm2d(error_unnormalized * normalizer)
                 norm_normalized = _norm2d(error_normalized)
-                if norm_pixels > RESIDUAL_PIXEL_CUTOFF:
+                norm_angle = error_angular[0]
+                if norm_pixels > RESIDUAL_PIXEL_CUTOFF or math.isnan(norm_angle):
                     continue
                 average_error_normalized += norm_normalized
                 average_error_pixels += norm_pixels
+                average_error_angular += norm_angle
                 all_errors_normalized.append(norm_normalized)
                 all_errors_pixels.append(norm_pixels)
+                all_errors_angular.append(norm_angle)
 
     error_count = len(all_errors_normalized)
     if error_count == 0:
-        return -1.0
+        return (-1.0, -1.0, -1.0, ([], []), ([], []), ([], []))
 
     bins = 30
     return (
         average_error_normalized / error_count,
         average_error_pixels / error_count,
+        average_error_angular / error_count,
         np.histogram(all_errors_normalized, bins),
         np.histogram(all_errors_pixels, bins),
+        np.histogram(all_errors_angular, bins),
     )
 
 
@@ -186,23 +202,31 @@ def reconstruction_statistics(data: DataSetBase, tracks_manager, reconstructions
     lengths, counts = np.array([int(x[0]) for x in hist_agg]), np.array(
         [x[1] for x in hist_agg]
     )
+
+    points_count = stats["reconstructed_points_count"]
+    points_count_over_two = sum(counts[1:])
     stats["observations_count"] = int(sum(lengths * counts))
     stats["average_track_length"] = (
-        stats["observations_count"] / stats["reconstructed_points_count"]
+        (stats["observations_count"] / points_count) if points_count > 0 else -1
     )
-    stats["average_track_length_over_two"] = int(sum(lengths[1:] * counts[1:])) / sum(
-        counts[1:]
+    stats["average_track_length_over_two"] = (
+        (int(sum(lengths[1:] * counts[1:])) / points_count_over_two)
+        if points_count_over_two > 0
+        else -1
     )
     stats["histogram_track_length"] = {k: v for k, v in hist_agg}
 
     (
         avg_normalized,
         avg_pixels,
+        avg_angular,
         (hist_normalized, bins_normalized),
         (hist_pixels, bins_pixels),
-    ) = _projection_error(data, tracks_manager, reconstructions)
+        (hist_angular, bins_angular),
+    ) = _projection_error(tracks_manager, reconstructions)
     stats["reprojection_error_normalized"] = avg_normalized
     stats["reprojection_error_pixels"] = avg_pixels
+    stats["reprojection_error_angular"] = avg_angular
     stats["reprojection_histogram_normalized"] = (
         list(map(float, hist_normalized)),
         list(map(float, bins_normalized)),
@@ -210,6 +234,10 @@ def reconstruction_statistics(data: DataSetBase, tracks_manager, reconstructions
     stats["reprojection_histogram_pixels"] = (
         list(map(float, hist_pixels)),
         list(map(float, bins_pixels)),
+    )
+    stats["reprojection_histogram_angular"] = (
+        list(map(float, hist_angular)),
+        list(map(float, bins_angular)),
     )
 
     return stats
@@ -244,11 +272,15 @@ def processing_statistics(data: DataSet, reconstructions):
         filter(lambda x: x >= 0, steps_times.values())
     )
 
-    stats["date"] = datetime.datetime.fromtimestamp(
-        os.path.getmtime(data._reconstruction_file(None))
-    ).strftime("%d/%m/%Y at %H:%M:%S")
+    try:
+        stats["date"] = datetime.datetime.fromtimestamp(
+            data.io_handler.timestamp(data._reconstruction_file(None))
+        ).strftime("%d/%m/%Y at %H:%M:%S")
+    except FileNotFoundError:
+        stats["date"] = "unknown"
 
-    min_x, min_y, max_x, max_y = 1e30, 1e30, 0, 0
+    default_max = 1e30
+    min_x, min_y, max_x, max_y = default_max, default_max, 0, 0
     for rec in reconstructions:
         for shot in rec.shots.values():
             o = shot.pose.get_origin()
@@ -256,13 +288,19 @@ def processing_statistics(data: DataSet, reconstructions):
             min_y = min(min_y, o[1])
             max_x = max(max_x, o[0])
             max_y = max(max_y, o[1])
-    stats["area"] = (max_x - min_x) * (max_y - min_y)
+    stats["area"] = (max_x - min_x) * (max_y - min_y) if min_x != default_max else -1
     return stats
 
 
 def features_statistics(data: DataSetBase, tracks_manager, reconstructions):
     stats = {}
-    detected = [len(data.load_features(im)[0]) for im in data.images()]
+    detected = []
+    images = {s for r in reconstructions for s in r.shots}
+    for im in images:
+        features_data = feature_loader.instance.load_all_data(data, im, False)
+        if not features_data:
+            continue
+        detected.append(len(features_data.points))
     if len(detected) > 0:
         stats["detected_features"] = {
             "min": min(detected),
@@ -286,16 +324,12 @@ def features_statistics(data: DataSetBase, tracks_manager, reconstructions):
     per_shots = list(per_shots.values())
 
     stats["reconstructed_features"] = {
-        "min": int(min(per_shots)),
-        "max": int(max(per_shots)),
-        "mean": int(np.mean(per_shots)),
-        "median": int(np.median(per_shots)),
+        "min": int(min(per_shots)) if len(per_shots) > 0 else -1,
+        "max": int(max(per_shots)) if len(per_shots) > 0 else -1,
+        "mean": int(np.mean(per_shots)) if len(per_shots) > 0 else -1,
+        "median": int(np.median(per_shots)) if len(per_shots) > 0 else -1,
     }
     return stats
-
-
-def matching_statistics(data: DataSetBase):
-    return {}
 
 
 def _cameras_statistics(camera_model):
@@ -360,7 +394,6 @@ def compute_all_statistics(data: DataSet, tracks_manager, reconstructions):
     stats["features_statistics"] = features_statistics(
         data, tracks_manager, reconstructions
     )
-    stats["matching_statistics"] = matching_statistics(data)
     stats["reconstruction_statistics"] = reconstruction_statistics(
         data, tracks_manager, reconstructions
     )
@@ -396,7 +429,13 @@ def _get_gaussian_kernel(radius, ratio):
     return kernel / sum(np.ndarray.flatten(kernel))
 
 
-def save_matchgraph(data: DataSetBase, tracks_manager, reconstructions, output_path):
+def save_matchgraph(
+    data: DataSetBase,
+    tracks_manager,
+    reconstructions,
+    output_path,
+    io_handler,
+):
     all_shots = []
     all_points = []
     shot_component = {}
@@ -444,16 +483,22 @@ def save_matchgraph(data: DataSetBase, tracks_manager, reconstructions, output_p
         label="Number of matches between images",
         pad=0.0,
     )
-    plt.savefig(
-        os.path.join(output_path, "matchgraph.png"),
-        dpi=300,
-        bbox_inches="tight",
-    )
+
+    with io_handler.open(os.path.join(output_path, "matchgraph.png"), "wb") as fwb:
+        plt.savefig(
+            fwb,
+            dpi=300,
+            bbox_inches="tight",
+        )
 
 
-def save_residual_histogram(stats, output_path):
+def save_residual_histogram(
+    stats,
+    output_path,
+    io_handler,
+):
     backup = dict(mpl.rcParams)
-    fig, axs = plt.subplots(1, 2, tight_layout=True, figsize=(15, 3))
+    fig, axs = plt.subplots(1, 3, tight_layout=True, figsize=(15, 3))
 
     h_norm, b_norm = stats["reconstruction_statistics"][
         "reprojection_histogram_normalized"
@@ -471,18 +516,34 @@ def save_residual_histogram(stats, output_path):
     for i in range(len(p_pixel)):
         p_pixel[i].set_facecolor(plt.cm.viridis(n[i] / max(n)))
 
+    h_angular, b_angular = stats["reconstruction_statistics"][
+        "reprojection_histogram_angular"
+    ]
+    n, _, p_angular, = axs[
+        2
+    ].hist(b_angular[:-1], b_angular, weights=h_angular)
+    n = n.astype("int")
+    for i in range(len(p_angular)):
+        p_angular[i].set_facecolor(plt.cm.viridis(n[i] / max(n)))
+
     axs[0].set_title("Normalized Residual")
     axs[1].set_title("Pixel Residual")
+    axs[2].set_title("Angular Residual")
 
-    plt.savefig(
-        os.path.join(output_path, "residual_histogram.png"),
-        dpi=300,
-        bbox_inches="tight",
-    )
+    with io_handler.open(
+        os.path.join(output_path, "residual_histogram.png"), "wb"
+    ) as fwb:
+        plt.savefig(
+            fwb,
+            dpi=300,
+            bbox_inches="tight",
+        )
     mpl.rcParams = backup
 
 
-def save_topview(data: DataSetBase, tracks_manager, reconstructions, output_path):
+def save_topview(
+    data: DataSetBase, tracks_manager, reconstructions, output_path, io_handler
+):
     points = []
     colors = []
     for rec in reconstructions:
@@ -634,15 +695,17 @@ def save_topview(data: DataSetBase, tracks_manager, reconstructions, output_path
         [0, f"{int(size_y / 2):.0f}", f"{size_y:.0f} meters"],
         fontsize="small",
     )
+    with io_handler.open(os.path.join(output_path, "topview.png"), "wb") as fwb:
+        plt.savefig(
+            fwb,
+            dpi=300,
+            bbox_inches="tight",
+        )
 
-    plt.savefig(
-        os.path.join(output_path, "topview.png"),
-        dpi=300,
-        bbox_inches="tight",
-    )
 
-
-def save_heatmap(data: DataSetBase, tracks_manager, reconstructions, output_path):
+def save_heatmap(
+    data: DataSetBase, tracks_manager, reconstructions, output_path, io_handler
+):
     all_projections = {}
 
     splatting = 15
@@ -703,23 +766,34 @@ def save_heatmap(data: DataSetBase, tracks_manager, reconstructions, output_path
         )
 
         plt.xticks(
+            # pyre-fixme[61]: `w` may not be initialized here.
             [0, buckets_x / 2, buckets_x], [0, int(w / 2), w], fontsize="x-small"
         )
         plt.yticks(
+            # pyre-fixme[61]: `h` may not be initialized here.
             [buckets_y, buckets_y / 2, 0], [0, int(h / 2), h], fontsize="x-small"
         )
 
+    with io_handler.open(
+        os.path.join(
+            output_path, "heatmap_" + str(camera_id.replace("/", "_")) + ".png"
+        ),
+        "wb",
+    ) as fwb:
+
         plt.savefig(
-            os.path.join(
-                output_path, "heatmap_" + str(camera_id.replace("/", "_")) + ".png"
-            ),
+            fwb,
             dpi=300,
             bbox_inches="tight",
         )
 
 
 def save_residual_grids(
-    data: DataSetBase, tracks_manager, reconstructions, output_path
+    data: DataSetBase,
+    tracks_manager,
+    reconstructions,
+    output_path,
+    io_handler,
 ):
     all_errors = {}
 
@@ -730,8 +804,12 @@ def save_residual_grids(
 
     for i in range(len(reconstructions)):
         valid_observations = _get_valid_observations(reconstructions, tracks_manager)(i)
-        errors_scaled = _compute_errors(reconstructions, tracks_manager)(i, True)
-        errors_unscaled = _compute_errors(reconstructions, tracks_manager)(i, False)
+        errors_scaled = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Normalized
+        )
+        errors_unscaled = _compute_errors(reconstructions, tracks_manager)(
+            i, pymap.ErrorType.Pixel
+        )
 
         for shot_id, shot_errors in errors_scaled.items():
             shot = reconstructions[i].get_shot(shot_id)
@@ -771,6 +849,7 @@ def save_residual_grids(
             camera_array_count[y, x, 0] += 1
         camera_array_res = np.divide(camera_array_res, camera_array_count)
 
+        # pyre-fixme[61]: `shot_id` may not be initialized here.
         shot = rec.get_shot(shot_id)
         w = shot.camera.width
         h = shot.camera.height
@@ -827,13 +906,18 @@ def save_residual_grids(
         plt.yticks(
             [0, buckets_y / 2, buckets_y], [0, int(h / 2), h], fontsize="x-small"
         )
-        plt.savefig(
+
+        with io_handler.open(
             os.path.join(
                 output_path, "residuals_" + str(camera_id.replace("/", "_")) + ".png"
             ),
-            dpi=300,
-            bbox_inches="tight",
-        )
+            "wb",
+        ) as fwb:
+            plt.savefig(
+                fwb,
+                dpi=300,
+                bbox_inches="tight",
+            )
 
 
 def decimate_points(reconstructions, max_num_points):
